@@ -1,6 +1,8 @@
+
 import numpy as np
 import scipy.sparse as sp
 import torch
+from collections import defaultdict
 
 from sklearn.model_selection import train_test_split
 
@@ -33,6 +35,7 @@ class NGCFDataLoader:
         ) = self._get_interaction_data()
         self.R = self._build_R()
         self.L = self._build_L()
+        self.user_pos = self._get_user_pos()
 
 
 
@@ -90,4 +93,56 @@ class NGCFDataLoader:
         d = np.array(A.sum(axis=1)).flatten()          # (N,)
         D_inv_sqrt = sp.diags(np.power(d + 1e-8, -0.5) )                  # sparse diagonal
 
-        return D_inv_sqrt @ A @ D_inv_sqrt # Normalized Laplacian Matrix
+        L = D_inv_sqrt @ A @ D_inv_sqrt # Normalized Laplacian Matrix
+        L = L.tocoo().astype(np.float32)
+
+        indices = torch.from_numpy(
+            np.vstack((L.row, L.col)).astype(np.int64)
+        )
+        values = torch.from_numpy(L.data)
+        shape = torch.Size(L.shape)
+
+        return torch.sparse.FloatTensor(indices, values, shape) # Sparse Tensor
+    
+    def _get_user_pos(self):
+        user_pos = defaultdict(set)
+
+        for _, (u, i) in self.train_df.iterrows():
+            user_pos[u].add(i)
+        return user_pos
+    
+    def get_bpr_batch(self, batch_size: int):
+        """
+        sample a mini-batch of (user, pos_item, neg_item) triplets for BPR training
+
+        returns:
+            users: Tensor of shape (batch_size,)
+            pos_items: Tensor of shape (batch_size,)
+            neg_items: Tensor of shape (batch_size,)
+        """
+        users = []
+        pos_items = []
+        neg_items = []
+
+        all_times = np.arange(self.item_num)
+
+        for _ in range(batch_size):
+            # 1) randomly sample a user at least on interaction
+            u = np.random.choice(list(self.user_pos.keys()))
+            i = np.random.choice(list(self.user_pos[u]))
+
+            # 2) randomly sample a negative item
+            while True:
+                j = np.random.choice(all_times)
+                if j not in self.user_pos[u]:
+                    break
+            
+            users.append(u)
+            pos_items.append(i)
+            neg_items.append(j)
+
+        return (
+            torch.LongTensor(users), 
+            torch.LongTensor(pos_items),
+            torch.LongTensor(neg_items)
+        )

@@ -1,126 +1,96 @@
-# main_ngcf.py
-import os
 
 import torch
-import torch.optim as optim
 
-from src.path import ROOT_DIR
 from src.utils import load_yaml, set_seed
-from src.data import NGCFDataLoader  
-from model.ngcf import NGCF, trainer_ngcf
+from src.path import SRC_PATH
+from src.data import NGCFDataLoader
+from model.ngcf import NGCF, trainer
 
 
+# ---------------------------------------------------
+# 실행 시작
+# ---------------------------------------------------
 if __name__ == "__main__":
-    # -------------------------------------------------------------------------
-    # Load Config
-    # -------------------------------------------------------------------------
-    CONFIG_FPATH = ROOT_DIR / "config_ngcf.yaml"  # or reuse "config.yaml" if you want
-    cfg = load_yaml(CONFIG_FPATH)
+
+    # ----------------------------
+    # 1. Load config
+    # ----------------------------
+    config_fpath = SRC_PATH / "config.yaml"
+    cfg = load_yaml(config_fpath)
 
     data_cfg = cfg["data"]
-    train_cfg = cfg["train"]
-    es_cfg = cfg["early_stopping"]
     model_cfg = cfg["model"]
-    opt_cfg = cfg["optimizer"]
+    train_cfg = cfg["train"]
+    eval_cfg = cfg["eval"]
+    path_cfg = cfg["path"]
 
-    # -------------------------------------------------------------------------
-    # Device & Seed
-    # -------------------------------------------------------------------------
-    req_dev = train_cfg.get("device", "cpu")
-    if req_dev == "cuda" and not torch.cuda.is_available():
-        print("[INFO] cuda is not available, switched to cpu.")
-        device = torch.device("cpu")
-    else:
-        device = torch.device(req_dev)
-    train_cfg["device"] = str(device)
+    # ----------------------------
+    # 2. Seed
+    # ----------------------------
+    set_seed(data_cfg.get("seed", 42))
 
-    set_seed(train_cfg.get("seed", 42))
+    # ----------------------------
+    # 3. Device
+    # ----------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Using device: {device}")
 
-    # Ensure checkpoint directory exists
-    best_model_path = train_cfg["best_model_path"]
-    best_model_dir = os.path.dirname(best_model_path)
-    if best_model_dir:
-        os.makedirs(best_model_dir, exist_ok=True)
-
-    # -------------------------------------------------------------------------
-    # Data Preparation (NGCFDataLoader)
-    # -------------------------------------------------------------------------
-    data_loader = NGCFDataLoader(
+    # ----------------------------
+    # 4. DataLoader 생성
+    # ----------------------------
+    print("[INFO] Loading data...")
+    dataloader = NGCFDataLoader(
         fname=data_cfg["fname"],
         source=data_cfg.get("source", "amazon"),
         test_size=data_cfg.get("test_size", 0.2),
-        val_size=data_cfg.get("val_size", 0.1),
-        random_state=data_cfg.get("random_state", 42),
+        seed=data_cfg.get("seed", 42),
     )
 
-    user_num = data_loader.user_num
-    item_num = data_loader.item_num
+    print(f"[INFO] #users: {dataloader.user_num}, #items: {dataloader.item_num}")
+    print(f"[INFO] #train interactions: {len(dataloader.train_df)}")
+    print(f"[INFO] #test  interactions: {len(dataloader.test_df)}")
 
-    print(f"[INFO] #users={user_num}, #items={item_num}")
-    print(f"[INFO] train={len(data_loader.train)}, val={len(data_loader.val)}, test={len(data_loader.test)}")
+    # sparse Laplacian
+    L = dataloader.L.to(device)
 
-    # -------------------------------------------------------------------------
-    # Model Initialization (NGCF)
-    # -------------------------------------------------------------------------
+    # ----------------------------
+    # 5. Model 생성
+    # ----------------------------
     model = NGCF(
-        user_num=user_num,
-        item_num=item_num,
-        norm_adj=data_loader.norm_adj,  # scipy sparse matrix
-        embed_dim=model_cfg.get("embed_dim", 64),
-        layer_sizes=model_cfg.get("layer_sizes", [64]),
-        regs=tuple(model_cfg.get("regs", [1e-5])),
-        node_dropout=model_cfg.get("node_dropout", 0.0),
-        mess_dropout=model_cfg.get("mess_dropout", 0.1),
-        device=str(device),
+        user_num=dataloader.user_num,
+        item_num=dataloader.item_num,
+        L=L,
+        embed_dim=model_cfg["embed_dim"],
+        n_layer=model_cfg["n_layer"],
+        dropout=model_cfg["dropout"],
+        l2_reg=model_cfg["l2_reg"],
+        negative_slope=model_cfg.get("negative_slope", 0.2),
     ).to(device)
 
-    # Make sure trainer can access model.device
-    model.device = device
+    print("[INFO] Model:")
+    print(model)
 
-    # -------------------------------------------------------------------------
-    # Optimizer (BPR loss is inside the model, so no criterion needed)
-    # -------------------------------------------------------------------------
-    opt_name = opt_cfg["name"].lower()
-    if opt_name == "adam":
-        optimizer = optim.Adam(
-            model.parameters(),
-            lr=opt_cfg["lr"],
-            weight_decay=opt_cfg.get("weight_decay", 0.0),
-            betas=tuple(opt_cfg.get("betas", [0.9, 0.999])),
-        )
-    elif opt_name == "adamw":
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=opt_cfg["lr"],
-            weight_decay=opt_cfg.get("weight_decay", 0.0),
-            betas=tuple(opt_cfg.get("betas", [0.9, 0.999])),
-        )
-    elif opt_name == "sgd":
-        optimizer = optim.SGD(
-            model.parameters(),
-            lr=opt_cfg["lr"],
-            weight_decay=opt_cfg.get("weight_decay", 0.0),
-        )
-    else:
-        raise NotImplementedError(f"Optimizer '{opt_cfg['name']}' is not implemented.")
-
-    # -------------------------------------------------------------------------
-    # Training (with Early Stopping & Best Model Saving)
-    # -------------------------------------------------------------------------
-    trainer_ngcf(
-        model=model,
-        data_loader=data_loader,
-        optimizer=optimizer,
-        num_epochs=train_cfg["num_epochs"],
-        num_batches=train_cfg["num_batches_per_epoch"],
-        batch_size=train_cfg["batch_size"],
-        eval_interval=train_cfg.get("eval_interval", 2),
-        patience=es_cfg["patience"],
-        min_delta=es_cfg.get("min_delta", 0.0),
-        best_model_path=train_cfg["best_model_path"],
-        K=train_cfg.get("topk", 10),
-        num_users_eval=train_cfg.get("num_users_eval", 10000),
-        num_neg=train_cfg.get("num_neg_eval", 100),
+    # ----------------------------
+    # 6. Optimizer 생성
+    # ----------------------------
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=train_cfg["lr"],
     )
 
-    print("[DONE] NGCF training finished.")
+    # ----------------------------
+    # 7. Train 루프 실행
+    # ----------------------------
+    trainer(
+        model=model,
+        data_loader=dataloader,
+        optimizer=optimizer,
+        batch_size=train_cfg["batch_size"],
+        epoch_num=train_cfg["epoch_num"],
+        num_batches_per_epoch=train_cfg["num_batches_per_epoch"],
+        eval_interval=train_cfg["eval_interval"],
+        eval_k=eval_cfg["k"],
+        patience=train_cfg["patience"],
+        best_model_path=path_cfg["best_model_path"],
+        device=device,
+    )
